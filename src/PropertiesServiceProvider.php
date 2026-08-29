@@ -15,6 +15,8 @@ final class PropertiesServiceProvider extends ServiceProvider
         $this->app->singleton(Application\RecordPropertyKey::class);
         $this->app->singleton(Application\TogglePropertyFavorite::class);
         $this->app->singleton(Application\RemovePropertyFavorite::class);
+        $this->app->singleton(Application\SavePropertySearch::class);
+        $this->app->singleton(Application\DeletePropertySearch::class);
     }
 
     public function boot(): void
