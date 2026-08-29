@@ -11,7 +11,8 @@
         "laravel": "^13.0",
         "packages": {
             "liberusoftware/module-manager": "^1.0",
-            "liberusoftware/organizations-teams": "^1.0"
+            "liberusoftware/organizations-teams": "^1.0",
+            "liberusoftware/real-estate-core": "^1.0"
         }
     },
     "suggests": {
@@ -22,9 +23,6 @@
     "capabilities": ["real-estate.properties"],
     "default_enabled": true,
     "features": [
-        "Team-scoped property records",
-        "Property lifecycle and status transitions",
-        "Structured characteristics and utilities",
-        "Property history events"
+        "Address/location", "Units", "Characteristics", "Tenure", "Utilities", "Features", "Status", "History", "Keys"
     ]
 }
