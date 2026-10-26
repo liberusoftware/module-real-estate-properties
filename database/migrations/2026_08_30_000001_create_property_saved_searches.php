@@ -20,5 +20,9 @@ return new class() extends Migration
             $table->index(['team_id', 'user_id']);
         });
     }
-    public function down(): void { Schema::dropIfExists('real_estate_property_saved_searches'); }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('real_estate_property_saved_searches');
+    }
 };

@@ -10,6 +10,10 @@ final class RemovePropertyFavorite
 {
     public function handle(int|string $teamId, int|string $userId, int|string $propertyId): bool
     {
-        return PropertyFavorite::query()->where('team_id', $teamId)->where('user_id', $userId)->where('property_id', $propertyId)->delete() > 0;
+        return PropertyFavorite::query()
+            ->where('team_id', $teamId)
+            ->where('user_id', $userId)
+            ->where('property_id', $propertyId)
+            ->delete() > 0;
     }
 }

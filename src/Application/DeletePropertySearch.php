@@ -8,5 +8,8 @@ use Liberu\RealEstate\Properties\Models\PropertySavedSearch;
 
 final class DeletePropertySearch
 {
-    public function handle(int|string $teamId, int|string $userId, int|string $searchId): bool { return PropertySavedSearch::query()->forUser($teamId, $userId)->whereKey($searchId)->delete() > 0; }
+    public function handle(int|string $teamId, int|string $userId, int|string $searchId): bool
+    {
+        return PropertySavedSearch::query()->forUser($teamId, $userId)->whereKey($searchId)->delete() > 0;
+    }
 }

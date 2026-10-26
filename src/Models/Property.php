@@ -10,9 +10,13 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\Cache;
+use Liberu\Foundation\Organizations\Models\Team;
 use Liberu\RealEstate\Core\Models\Branch;
-use Liberu\RealEstate\Properties\Domain\PropertyStatus;
+use Liberu\RealEstate\Core\Models\Territory;
+use Liberu\RealEstate\Properties\Domain\DealType;
 use Liberu\RealEstate\Properties\Domain\PropertyGalleryItem;
+use Liberu\RealEstate\Properties\Domain\PropertyStatus;
 
 final class Property extends Model
 {
@@ -33,6 +37,10 @@ final class Property extends Model
         'townhouse' => 'Townhouse',
         'villa' => 'Villa',
         'hmo' => 'HMO',
+        'guesthouse' => 'Guesthouse',
+        'hostel' => 'Hostel',
+        'hunting-lodge' => 'Hunting lodge',
+        'cottage' => 'Cottage',
     ];
 
     /** @var list<string> */
@@ -46,6 +54,7 @@ final class Property extends Model
     {
         return [
             'status' => PropertyStatus::class,
+            'deal_type' => DealType::class,
             'characteristics' => 'array',
             'utilities' => 'array',
             'features' => 'array',
@@ -64,6 +73,12 @@ final class Property extends Model
             'list_date' => 'date',
             'sold_date' => 'date',
             'is_featured' => 'boolean',
+            'has_generator' => 'boolean',
+            'has_wifi' => 'boolean',
+            'has_parking' => 'boolean',
+            'altitude' => 'integer',
+            'max_guests' => 'integer',
+            'views_count' => 'integer',
             'live_tour_available' => 'boolean',
             'ar_tour_enabled' => 'boolean',
             'ar_tour_settings' => 'array',
@@ -108,6 +123,36 @@ final class Property extends Model
     public function favorites(): HasMany
     {
         return $this->hasMany(PropertyFavorite::class);
+    }
+
+    public function priceAlerts(): HasMany
+    {
+        return $this->hasMany(PropertyPriceAlert::class);
+    }
+
+    public function reviews(): HasMany
+    {
+        return $this->hasMany(PropertyReview::class);
+    }
+
+    public function averageReviewRating(): float
+    {
+        return round((float) ($this->reviews()->approved()->avg('rating') ?? 0), 2);
+    }
+
+    public function approvedReviewCount(): int
+    {
+        return $this->reviews()->approved()->count();
+    }
+
+    /** @return Collection<int, CommunityEvent> */
+    public function getNearbyCommunityEvents(float|int|string $radius = 10): Collection
+    {
+        if ($this->latitude === null || $this->longitude === null) {
+            return new Collection();
+        }
+
+        return CommunityEvent::query()->forTeam($this->team_id)->public()->upcoming()->nearby($this->latitude, $this->longitude, $radius)->get();
     }
 
     public function branch(): BelongsTo
@@ -237,6 +282,33 @@ final class Property extends Model
         return strtolower((string) $this->property_type) === 'hmo';
     }
 
+    /**
+     * Human-readable listing number — "IH-2026-00015" — for staff/callers
+     * to reference instead of the raw database id. Computed from id +
+     * creation year rather than a stored column: both inputs are already
+     * unique/immutable, so there's nothing to keep in sync or backfill.
+     */
+    public function reference(): string
+    {
+        return sprintf('%s-%d-%05d', config('app.property_reference_prefix', 'RE'), $this->created_at?->year ?? now()->year, $this->getKey());
+    }
+
+    /**
+     * Increments views_count at most once per visitor per property per day.
+     * $visitorKey is typically the request IP — hashed here so nothing
+     * identifying is persisted, only used transiently as a cache key.
+     * Cache::add() is atomic (SET NX under the redis driver), so concurrent
+     * requests from the same visitor can't double-count.
+     */
+    public function recordView(string $visitorKey): void
+    {
+        $cacheKey = 'property-view:'.$this->getKey().':'.hash('xxh128', $visitorKey);
+
+        if (Cache::add($cacheKey, true, now()->addDay())) {
+            $this->increment('views_count');
+        }
+    }
+
     public function hasActiveInsurance(): bool
     {
         return filled($this->insurance_policy_id)
@@ -247,10 +319,14 @@ final class Property extends Model
     public function daysListed(): ?int
     {
         if ($this->list_date === null || $this->list_date->isFuture()) {
-            return $this->list_date === null ? null : 0;
+            return null;
         }
 
-        return (int) $this->list_date->startOfDay()->diffInDays(now()->startOfDay());
+        $end = $this->sold_date !== null && $this->sold_date->isBefore(now())
+            ? $this->sold_date
+            : now();
+
+        return (int) $this->list_date->startOfDay()->diffInDays($end->startOfDay());
     }
 
     public function pricePerSquareFoot(): ?float
@@ -260,6 +336,142 @@ final class Property extends Model
         }
 
         return round((float) $this->price / (float) $this->area_sqft, 2);
+    }
+
+    public function isRental(): bool
+    {
+        return in_array($this->deal_type, [DealType::Rent, DealType::Daily], true) || in_array(strtolower(trim($this->statusValue())), [
+            'to_let', 'let', 'let_agreed', 'for rent', 'for_rent', 'rented', 'rent', 'rental',
+        ], true);
+    }
+
+    public function pricePerSquareFootLabel(): string
+    {
+        return $this->currencySymbol().'/sq ft';
+    }
+
+    public function pricePerSquareFootForHumans(): ?string
+    {
+        $value = $this->pricePerSquareFoot();
+        if ($value === null) {
+            return null;
+        }
+
+        $formatted = rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.');
+
+        return $this->isRental() ? $formatted.($this->deal_type === DealType::Daily ? ' per day' : ' pcm') : $formatted;
+    }
+
+    public function scopeWithinBounds(Builder $query, float $minLat, float $minLng, float $maxLat, float $maxLng): Builder
+    {
+        return $query->whereBetween('latitude', [$minLat, $maxLat])
+            ->when($minLng <= $maxLng,
+                fn (Builder $query): Builder => $query->whereBetween('longitude', [$minLng, $maxLng]),
+                fn (Builder $query): Builder => $query->where(fn (Builder $query): Builder => $query->where('longitude', '>=', $minLng)->orWhere('longitude', '<=', $maxLng)),
+            );
+    }
+
+    public function pricePerSquareMeter(): ?float
+    {
+        $perSquareFoot = $this->pricePerSquareFoot();
+
+        return $perSquareFoot === null ? null : round((float) $this->price / ((float) $this->area_sqft * 0.09290304), 2);
+    }
+
+    public function pricePerSquareMeterLabel(): string
+    {
+        return $this->currencySymbol().'/m²';
+    }
+
+    public function pricePerSquareMeterForHumans(): ?string
+    {
+        $value = $this->pricePerSquareMeter();
+
+        return $value === null ? null : rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.').($this->isRental() ? ($this->deal_type === DealType::Daily ? ' per day' : ' pcm') : '');
+    }
+
+    public function region(): BelongsTo
+    {
+        return $this->belongsTo(Region::class);
+    }
+
+    public function city(): BelongsTo
+    {
+        return $this->belongsTo(City::class);
+    }
+
+    public function district(): BelongsTo
+    {
+        return $this->belongsTo(District::class);
+    }
+
+    public function agent(): BelongsTo
+    {
+        return $this->belongsTo(config('auth.providers.users.model'), 'agent_id');
+    }
+
+    public function currencySymbol(): string
+    {
+        return match (strtoupper((string) ($this->currency ?: config('app.currency', 'GBP')))) {
+            'GBP' => '£', 'EUR' => '€', 'USD' => '$', 'CAD' => 'CA$', 'AUD' => 'A$',
+            default => filled($this->currency) ? (string) $this->currency.' ' : (string) config('app.currency', 'GBP').' ',
+        };
+    }
+
+    public function tenureForHumans(): ?string
+    {
+        $tenure = strtolower(trim((string) $this->tenure));
+        if ($tenure === '') {
+            return null;
+        }
+
+        return $tenure === 'leasehold' && $this->lease_years_remaining !== null
+            ? 'Leasehold, '.$this->lease_years_remaining.' years remaining'
+            : ucfirst($tenure);
+    }
+
+    public function hasShortLease(): bool
+    {
+        return strtolower(trim((string) $this->tenure)) === 'leasehold'
+            && $this->lease_years_remaining !== null
+            && (int) $this->lease_years_remaining < 80;
+    }
+
+    public function annualEnergyCost(): ?float
+    {
+        $cost = data_get($this->epc, 'annual_energy_cost');
+        if (is_numeric($cost)) {
+            return (float) $cost;
+        }
+
+        $parts = collect(['heating_cost', 'hot_water_cost', 'lighting_cost'])
+            ->map(fn (string $key): mixed => data_get($this->epc, $key))
+            ->filter(fn (mixed $value): bool => is_numeric($value));
+
+        return $parts->isEmpty() ? null : (float) $parts->sum();
+    }
+
+    public function isComingSoon(): bool
+    {
+        return $this->list_date !== null && $this->list_date->isFuture();
+    }
+
+    public function closedStateLabel(): ?string
+    {
+        return match (strtolower(trim($this->statusValue()))) {
+            'sstc', 'sold_stc', 'sold stc' => 'Sold STC', 'exchanged' => 'Exchanged',
+            'archived', 'withdrawn' => 'Withdrawn', 'under_offer', 'under offer' => 'Under offer',
+            'let_agreed', 'let agreed' => 'Let agreed', 'sold' => 'Sold', default => null,
+        };
+    }
+
+    private function statusValue(): string
+    {
+        $status = $this->getAttribute('status');
+
+        return $status instanceof PropertyStatus
+            ? $status->value
+            : (string) ($status ?? $this->getRawOriginal('status'));
     }
 
     /** @return array<string, mixed> */
@@ -292,12 +504,58 @@ final class Property extends Model
         }
 
         return [
-            'energy' => ['label' => 'Energy', 'value' => $energyValue, 'source' => $epcDate ? 'Certificate, assessed '.$epcDate : 'Certificate'],
-            'floor_area' => ['label' => 'Floor area', 'value' => $this->area_sqft, 'source' => 'Property record'],
-            'year_built' => ['label' => 'Built', 'value' => $this->year_built, 'source' => 'Property record'],
-            'price_per_square_foot' => ['label' => 'Price per square foot', 'value' => $this->pricePerSquareFoot(), 'source' => 'Derived from price and floor area'],
-            'days_listed' => ['label' => 'Days listed', 'value' => $this->daysListed(), 'source' => $this->list_date ? 'Derived from listing date' : 'Listing date'],
-            'council_tax_band' => ['label' => 'Council tax band', 'value' => $this->council_tax_band, 'source' => 'Property record'],
+            'energy' => [
+                'label' => 'Energy',
+                'value' => $energyValue,
+                'source' => $epcDate ? 'Certificate, assessed '.$epcDate : 'Certificate',
+            ],
+            'floor_area' => [
+                'label' => 'Floor area',
+                'value' => $this->area_sqft,
+                'source' => 'Property record',
+            ],
+            'year_built' => [
+                'label' => 'Built',
+                'value' => $this->year_built,
+                'source' => 'Property record',
+            ],
+            'price_per_square_foot' => [
+                'label' => 'Price per square foot',
+                'value' => $this->pricePerSquareFoot(),
+                'source' => 'Derived from price and floor area',
+            ],
+            'days_listed' => [
+                'label' => 'Days listed',
+                'value' => $this->daysListed(),
+                'source' => $this->list_date ? 'Derived from listing date' : 'Listing date',
+            ],
+            'council_tax_band' => [
+                'label' => 'Council tax band',
+                'value' => $this->council_tax_band,
+                'source' => 'Property record',
+            ],
+            'tenure' => [
+                'label' => 'Tenure',
+                'value' => $this->tenureForHumans(),
+                'source' => 'Property record',
+            ],
+            'service_charge' => [
+                'label' => 'Service charge',
+                'value' => $this->service_charge === null ? null : $this->currencySymbol().number_format((float) $this->service_charge, 0).' a year',
+                'source' => 'Property record',
+            ],
+            'ground_rent' => [
+                'label' => 'Ground rent',
+                'value' => $this->ground_rent === null
+                    ? null
+                    : ((float) $this->ground_rent === 0.0 ? 'Peppercorn' : $this->currencySymbol().number_format((float) $this->ground_rent, 0).' a year'),
+                'source' => 'Property record',
+            ],
+            'annual_energy_cost' => [
+                'label' => 'Annual energy cost',
+                'value' => $this->annualEnergyCost() === null ? null : $this->currencySymbol().number_format($this->annualEnergyCost(), 0).' a year',
+                'source' => 'Energy certificate',
+            ],
         ];
     }
 
@@ -471,5 +729,15 @@ final class Property extends Model
     public function canBePublished(): bool
     {
         return filled($this->address) && $this->status === PropertyStatus::Draft;
+    }
+
+    public function team()
+    {
+        return $this->belongsTo(Team::class);
+    }
+
+    public function territory()
+    {
+        return $this->belongsTo(Territory::class);
     }
 }
